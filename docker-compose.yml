@@ -1,0 +1,30 @@
+name: ma-short-live
+
+services:
+  ma-short:
+    build: .
+    image: ma-short-live:latest
+    container_name: ma-short-live
+    restart: unless-stopped
+    # 所有配置(凭证+策略参数)都只从 .env 读, 这里不再重复声明。
+    #
+    # 【为什么不用 environment: 列参数】
+    # compose 的 "${VAR:-default}" 是从**宿主 shell** 取值, 不从 env_file 取。宿主没导出
+    # 该变量时就落到 default, 而 environment 的优先级高于 env_file —— 结果 .env 里改好的
+    # 新参数被这里的旧默认值静默覆盖。2026-08-07 就踩过: .env 已是 MA90/N20/MA出场,
+    # 容器实际跑的却是 MA30/N36/无MA出场, 日志里才发现。
+    # 单一来源(只 env_file)虽然少了"参数一览"的文档价值, 但消除了这类静默不一致。
+    # 参数说明见 .env 内的注释, 那里是唯一权威。
+    env_file:
+      - .env
+    # 让容器能连到宿主机上的代理端口 (Linux 需要; Docker Desktop 自带)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/app                              # 项目代码挂进 /app: 改代码免重新 build, 直接重启即可
+      - ./data:/data                        # live_state.json 持久化, 重启不丢持仓记录
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

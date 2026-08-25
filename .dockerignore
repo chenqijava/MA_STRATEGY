@@ -1,0 +1,20 @@
+# 凭证与本地状态, 绝不打进镜像
+.env
+data/
+live_state.json
+
+# 回测产物/数据/缓存, 实盘镜像用不到
+results/
+__pycache__/
+*.pyc
+*.csv
+*.md
+
+# 回测专用脚本 (实盘只需 live_ma_short + ma_pullback + combo_core)
+run_*.py
+wf_*.py
+fetch_*.py
+scan_*.py
+sig_*.py
+validate.py
+walk_forward.py
