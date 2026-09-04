@@ -741,12 +741,12 @@ def open_short(ex, sym, close, atr, equity, contracts, ctv):
     stop = entry + CFG['ATR_SL'] * atr        # 空头止损在上方
     target = entry - CFG['ATR_TP'] * atr      # 空头止盈在下方
 
-    intent = dict(sym=sym, side='short', contracts=contracts, ctv=ctv, entry=round(entry, 6),
-                  stop=round(stop, 6), target=round(target, 6),
+    intent = dict(sym=sym, side='short', contracts=contracts, ctv=ctv, entry=entry,
+                  stop=stop, target=target,
                   entry_time=datetime.now(timezone.utc).isoformat())
 
     if DRY_RUN:
-        log(f'[DRY_RUN][{sym}] 开空 {contracts}张 @~{entry:.4f}  TP={target:.4f} SL={stop:.4f} '
+        log(f'[DRY_RUN][{sym}] 开空 {contracts}张 @~{entry:.6g}  TP={target:.6g} SL={stop:.6g} '
             f'(名义~{contracts*close*ctv:.0f}U, 保证金~{contracts*close*ctv/LEVERAGE:.0f}U)')
         return intent
 
@@ -754,21 +754,44 @@ def open_short(ex, sym, close, atr, equity, contracts, ctv):
     ex.set_leverage(LEVERAGE, im, params={'mgnMode': 'isolated', **_pos_side_params('sell')})
     # 开空 + 附带止盈止损(attachAlgoOrds): 一次下单让交易所把 TP/SL 绑到本仓,
     # 避免"开仓成功但挂单失败 → 裸空单无止损"。TP/SL 是 algo 委托, 不能当普通 market 单下(上一版 ordType 报错的根因)。
-    params = {
-        'tdMode': 'isolated',
-        **_pos_side_params('sell'),
-        'attachAlgoOrds': [{
-            'tpTriggerPx': str(intent['target']), 'tpOrdPx': '-1',   # -1 = 市价止盈
-            'slTriggerPx': str(intent['stop']),   'slOrdPx': '-1',   # -1 = 市价止损
-            'tpTriggerPxType': 'last', 'slTriggerPxType': 'last',
-        }],
-    }
+    #
+    # 触发价转字符串两条铁律 (2026-09-04 PEPE 实测踩坑):
+    #   1. 不能 round(x, 6) 后 str(): ~1e-6 的小价格会变科学计数法 '3e-06', OKX 拒收(51000
+    #      Parameter tpTriggerPx error)。须按合约 tick 用 price_to_precision 格式化成十进制。
+    #   2. 触发价要合法: 做空 TP 须 0<TP<entry, SL 须 >entry。ATR 相对价格很大时 (PEPE 这类
+    #      ATR≈1e-7 而价≈1e-6), entry-10·ATR 可能 ≤0 → OKX 拒收。且价格按 tick 取整后可能
+    #      归零 (价 1e-10 对 tick 1e-9 → 0), 所以校验要放在取整之后, 对格式化结果判。
+    #      无效那一侧跳过, 由 MA出场(收盘站上慢线)/时停(MAX_BARS) 兜底, 不让整笔开仓失败。
+    attach, tp_s, sl_s = [], None, None
+    try:
+        tp_s = ex.price_to_precision(im, target) if 0 < target < entry else None
+        if tp_s and float(tp_s) > 0 and float(tp_s) < entry:
+            attach.append({'tpTriggerPx': tp_s,
+                           'tpOrdPx': '-1', 'tpTriggerPxType': 'last'})   # -1 = 市价止盈
+        else:
+            log(f'[{sym}] 止盈价 {target:.6g} 无效 (取整后须 0<TP<入场{entry:.6g}), '
+                f'跳过止盈委托, 出场由 MA出场/时停兜底')
+        sl_s = ex.price_to_precision(im, stop) if stop > entry else None
+        if sl_s and float(sl_s) > entry:
+            attach.append({'slTriggerPx': sl_s,
+                           'slOrdPx': '-1', 'slTriggerPxType': 'last'})   # -1 = 市价止损
+        else:
+            log(f'[{sym}] 止损价 {stop:.6g} 无效 (取整后须>入场{entry:.6g}), 跳过止损委托')
+    except Exception as e:
+        log(f'[{sym}][warn] TP/SL 触发价格式化失败: {e}, 本次裸开 (由 MA出场/时停兜底)')
+        attach = []
+    params = {'tdMode': 'isolated', **_pos_side_params('sell')}
+    if attach:
+        params['attachAlgoOrds'] = attach
     o = ex.create_order(im, 'market', 'sell', contracts, params=params)
     avg = order_avg_px(ex, o, im)
     log_fill('entry', sym, close, avg, extra=f'contracts={contracts}')   # 参考=信号收盘价
     intent['fill'] = avg
-    log(f'[LIVE][{sym}] 已开空 {contracts}张 @{avg or "~"+format(entry,".4f")}  '
-        f'TP={target:.4f} SL={stop:.4f} (TP/SL已附带)')
+    # 日志用 attach 里的实际触发价 (tp_s/sl_s 可能是 None 或 '0', 统一显示成 跳过)
+    tp_l = tp_s if (tp_s and float(tp_s) > 0) else '跳过'
+    sl_l = sl_s if (sl_s and float(sl_s) > 0) else '跳过'
+    log(f'[LIVE][{sym}] 已开空 {contracts}张 @{avg or "~"+format(entry,".6g")}  '
+        f'TP={tp_l} SL={sl_l} ' + ('TP/SL已附带' if attach else '无algo, 靠脚本出场'))
     return intent
 
 
@@ -800,30 +823,42 @@ def open_fill_long(ex, sym, close, atr, contracts, ctv, trail_atr):
     entry = close * (1 + mp.SLIPPAGE)      # 做多买入, 成交价更高(不利)
     stop0 = entry - trail_atr * atr if (atr and atr > 0) else entry * 0.9
     intent = dict(sym=sym, side='long', contracts=contracts, ctv=ctv,
-                  entry=round(entry, 6), fill=entry, atr_entry=atr,
-                  ext=entry, stop0=round(stop0, 6), bars=0,
+                  entry=entry, fill=entry, atr_entry=atr,
+                  ext=entry, stop0=stop0, bars=0,
                   entry_time=datetime.now(timezone.utc).isoformat())
 
     if DRY_RUN:
-        log(f'[DRY_RUN][fill:{sym}] 开多 {contracts}张 @~{entry:.4f}  '
-            f'初始止损={stop0:.4f} (名义~{contracts*close*ctv:.0f}U, trail={trail_atr}xATR)')
+        log(f'[DRY_RUN][fill:{sym}] 开多 {contracts}张 @~{entry:.6g}  '
+            f'初始止损={stop0:.6g} (名义~{contracts*close*ctv:.0f}U, trail={trail_atr}xATR)')
         return intent
 
     im = inst(sym)
     ex.set_leverage(LEVERAGE, im, params={'mgnMode': 'isolated', **_pos_side_params('buy', 'long')})
-    params = {
-        'tdMode': 'isolated',
-        **_pos_side_params('buy', 'long'),
-        'attachAlgoOrds': [{
-            'slTriggerPx': str(stop0), 'slOrdPx': '-1', 'slTriggerPxType': 'last',
-        }],
-    }
+    # 初始止损委托: 只挂止损不挂止盈 (脚本追踪 ext 主动平)。触发价同 open_short 的坑:
+    # 小价格须按 tick 格式化成十进制 (str 会变科学计数法被 OKX 拒); 无效则跳过该保险
+    # (0<SL<entry 不满足 = ATR 大到止损位≤0), 由 process_fills 追踪止损/对冲平兜底。
+    attach, sl_s = [], None
+    try:
+        sl_s = ex.price_to_precision(im, stop0) if 0 < stop0 < entry else None
+        if sl_s and 0 < float(sl_s) < entry:
+            attach.append({'slTriggerPx': sl_s,
+                           'slOrdPx': '-1', 'slTriggerPxType': 'last'})
+        else:
+            log(f'[fill:{sym}] 初始止损 {stop0:.6g} 无效 (取整后须 0<SL<入场{entry:.6g}), '
+                f'跳过 algo 止损, 靠追踪止损兜底')
+    except Exception as e:
+        log(f'[fill:{sym}][warn] 止损触发价格式化失败: {e}, 跳过 algo 止损')
+        attach = []
+    params = {'tdMode': 'isolated', **_pos_side_params('buy', 'long')}
+    if attach:
+        params['attachAlgoOrds'] = attach
     o = ex.create_order(im, 'market', 'buy', contracts, params=params)
     avg = order_avg_px(ex, o, im)
     log_fill('fill_entry', sym, close, avg, extra=f'fill_long contracts={contracts}')
     intent['fill'] = avg
-    log(f'[LIVE][fill:{sym}] 已开多 {contracts}张 @{avg or "~"+format(entry,".4f")}  '
-        f'初始止损={stop0:.4f} (algo已挂)')
+    sl_l = sl_s if (sl_s and float(sl_s) > 0) else '跳过'
+    log(f'[LIVE][fill:{sym}] 已开多 {contracts}张 @{avg or "~"+format(entry,".6g")}  '
+        f'初始止损={sl_l} ' + ('algo已挂' if attach else '靠追踪止损'))
     return intent
 
 
@@ -1017,7 +1052,9 @@ def process_symbol(ex, st, sym, equity):
             f'(已用{used:.0f}+新增{add:.0f} > {cap:.0f}U), 跳过')
         return
 
-    log(f'[{sym}] 4h收盘 {bar_ts}: 做空信号 close={close:.4f} atr={atr:.4f}')
+    # close/atr 用 .6g 而非 .4f: PEPE/SHIB 这类 ~1e-6 的小价格 .4f 会打成 0.0000,
+    # 让人误以为数据坏了 (2026-09-04 排查 PEPE 开仓失败时踩到)。
+    log(f'[{sym}] 4h收盘 {bar_ts}: 做空信号 close={close:.6g} atr={atr:.6g}')
     # 下单前先落一条 pending 标记: 若在"下单已成交"与"save_state"之间进程被杀,
     # 重启后 sync_positions 能凭它认出这个仓是自己的, 而不是报成孤儿仓。
     # 代价是可能留下已下单失败的 pending, 由下面的清理逻辑按交易所实况纠正。

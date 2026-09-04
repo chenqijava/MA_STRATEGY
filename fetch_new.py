@@ -29,6 +29,10 @@ def make_ex():
     elif PROXY:
         cfg['httpProxy'] = PROXY
     ex = ccxt.okx(cfg)
+    # ccxt 4.x 实测: httpProxy 之外还需 session.proxies, 否则同步 requests 通道直连
+    # 解析 DNS 失败 (getaddrinfo)。见 live_ma_short.make_exchange 同款修复。
+    if PROXY and not PROXY.startswith('socks'):
+        ex.session.proxies = {'http': PROXY, 'https': PROXY}
     ex.load_markets()
     return ex
 
@@ -81,7 +85,12 @@ def fetch(ex, base, tf):
     df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df = df.drop_duplicates('timestamp').sort_values('timestamp')
-    df = df[(df['timestamp'] >= START_DATE) & (df['timestamp'] < END_DATE)]
+    # 过滤起点往前多留 7 天 (28 根 4h) 作为重叠缓冲, 避免新旧文件拼接时因边界丢棒:
+    # 旧文件到 08-31 04:00, 新文件若严格从 09-01 00:00 开始, 中间 08-31 08:00~20:00
+    # 四根就被 >=START_DATE 过滤掉, 形成 16h 空洞 (会让 MA90 计算错位)。
+    # 多留的缓冲在拼合时由 drop_duplicates 去重, 不影响结果。
+    filter_start = pd.Timestamp(START_DATE) - pd.Timedelta(days=7)
+    df = df[(df['timestamp'] >= filter_start) & (df['timestamp'] < END_DATE)]
     out = os.path.join(OUT_DIR, f'{base}-USDT-SWAP_{tf}_{tag(START_DATE)}_{tag(END_DATE)}.csv')
     df.to_csv(out, index=False)
     print(f'[{base} {tf}] 保存 {len(df)} 根 -> {out}  区间 {df.timestamp.iloc[0]} ~ {df.timestamp.iloc[-1]}')
