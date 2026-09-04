@@ -272,6 +272,9 @@ _HELD_TRACE = None      # simulate() 每次运行后写入: 逐根持仓币数
 # 名义 = 权益×TOTAL/N 随权益复利变化, 后期的笔天然金额更大, 重排会把顺序信息
 # 混进幅度里。相对收益率是尺度无关的, 才能重抽。见 monte_carlo.py。
 _TRADE_TRACE = None
+# 每笔交易明细 (sym/dir/entry/exit/时间/原因), 供"最近几笔"诊断用。
+# trades 只存浮点盈亏(缺币种与时间), _TRADE_TRACE 只有相对收益/根数/类型, 故另建旁路。
+_TRADE_DETAILS = None
 
 
 def btc_bull_mask(idx):
@@ -376,9 +379,10 @@ def simulate(N, idx, C, H, L, A, S, bull=None):
             raise RuntimeError('TRAIL_MA 已设但均线面板为空; 请在本次 import 后调用 build_panel()')
         TMv = _TRAIL_MA_PANEL.reindex(index=C.index, columns=C.columns).values
     T, nS = Cv.shape
-    global _HELD_TRACE, _TRADE_TRACE
+    global _HELD_TRACE, _TRADE_TRACE, _TRADE_DETAILS
     _HELD_TRACE = np.zeros(T, dtype=int)  # 每根K线的持仓币数(0 = 空仓)
     _TRADE_TRACE = []                     # (相对收益率, 持仓根数, 出场类型)
+    _TRADE_DETAILS = []                   # 每笔: dict(sym,dir,entry,exit,entry_time,exit_time,bars,why,pnl,kind)
     cool = np.zeros(nS, dtype=int)        # 各币剩余冷却根数
     done = np.zeros(nS, dtype=bool)       # COOLDOWN_ONCE: 本次窗口是否已做过
     # ---- 长多填仓预计算: 每标的一段 MA/ATR/金叉 (FILLS 注册制) ----
@@ -533,6 +537,11 @@ def simulate(N, idx, C, H, L, A, S, bull=None):
                     trades.append(st['realized'])
                     _TRADE_TRACE.append((st['realized'] / st['eq0'] if st['eq0'] > 0 else 0.0,
                                          st['bars'], 'partial'))
+                    _TRADE_DETAILS.append(dict(sym=st.get('sym', C.columns[j]), dir=st['dir'],
+                                               entry=st['entry'], exit=st['entry'],
+                                               entry_time=idx[st.get('entry_i', 0)], exit_time=idx[i],
+                                               bars=st['bars'], why='partial', pnl=st['realized'],
+                                               kind='main'))
                     del held[j]
                     cool[j] = COOLDOWN
                     done[j] = True
@@ -550,6 +559,11 @@ def simulate(N, idx, C, H, L, A, S, bull=None):
                 trades.append(net)
                 _TRADE_TRACE.append((net / st['eq0'] if st['eq0'] > 0 else 0.0,
                                      st['bars'], st.get('why', '?')))
+                _TRADE_DETAILS.append(dict(sym=st.get('sym', C.columns[j]), dir=st['dir'],
+                                           entry=st['entry'], exit=exit_px,
+                                           entry_time=idx[st.get('entry_i', 0)], exit_time=idx[i],
+                                           bars=st['bars'], why=st.get('why', '?'), pnl=net,
+                                           kind='main'))
                 del held[j]
                 cool[j] = COOLDOWN             # 平仓起算冷却
                 done[j] = True                 # 本次窗口已做过 (COOLDOWN_ONCE 用)
@@ -587,6 +601,11 @@ def simulate(N, idx, C, H, L, A, S, bull=None):
                     trades.append(net)
                     _TRADE_TRACE.append((net / p['eq0'] if p['eq0'] > 0 else 0.0,
                                          p['bars'], f"{f['cfg']['sym'].lower()}_fill"))
+                    _TRADE_DETAILS.append(dict(sym=p.get('sym', f['cfg']['sym']), dir=1,
+                                               entry=p['entry'], exit=exit_px,
+                                               entry_time=idx[p.get('entry_i', 0)], exit_time=idx[i],
+                                               bars=p['bars'], why='fill_trail', pnl=net,
+                                               kind='fill'))
                     f['pos'] = None
                 elif np.isfinite(h):
                     p['ext'] = max(p['ext'], h)
@@ -654,6 +673,11 @@ def simulate(N, idx, C, H, L, A, S, bull=None):
                         trades.append(net)
                         _TRADE_TRACE.append((net / f['pos']['eq0'] if f['pos']['eq0'] > 0 else 0.0,
                                              f['pos']['bars'], f"{f['cfg']['sym'].lower()}_fill_hedge"))
+                        _TRADE_DETAILS.append(dict(sym=f['pos'].get('sym', f['cfg']['sym']), dir=1,
+                                                   entry=f['pos']['entry'], exit=exit_px,
+                                                   entry_time=idx[f['pos'].get('entry_i', 0)],
+                                                   exit_time=idx[i], bars=f['pos']['bars'],
+                                                   why='fill_hedge', pnl=net, kind='fill'))
                         f['pos'] = None
                 # 出场参数按开仓时的牛熊状态固定 (与实盘一致: 挂单即定, 不随后续状态漂移)
                 is_bull = bull is not None and bull[i]
@@ -667,7 +691,7 @@ def simulate(N, idx, C, H, L, A, S, bull=None):
                     # 那就混入了"降敞口"效应, 无法单独看出场位置的作用。
                     notional *= min(RISK_CAP, ref_vol / (atr / c) * CFG['ATR_SL'] / sl)
                 equity -= notional * FEE
-                held[j] = dict(dir=sig, entry=entry,
+                held[j] = dict(dir=sig, entry=entry, sym=C.columns[j], entry_i=i,
                                stop=entry - sig * sl * atr,
                                target=entry + sig * tp * atr,
                                notional=notional, bars=0, max_bars=mb,
@@ -709,7 +733,8 @@ def simulate(N, idx, C, H, L, A, S, bull=None):
                     f['pos'] = dict(dir=1, entry=entry, notional=notional,
                                     bars=0, eq0=equity,
                                     ext=entry,           # 有利极值, 初始=入场价
-                                    stop0=stop0)         # 初始固定止损(未arming时的底)
+                                    stop0=stop0,         # 初始固定止损(未arming时的底)
+                                    sym=f['cfg']['sym'], entry_i=i)
                     if f['cfg']['once']:
                         f['done'] = True           # 本窗口已做过, 等快线回落再重置
         # ---- 资金费: 每根K线对持仓按名义扣 FUNDING_BP (bp) ----
