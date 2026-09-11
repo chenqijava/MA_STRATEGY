@@ -11,3 +11,4 @@ live_state.json
 /results/*.png
 # 运行时成交记录(实盘/模拟盘产生)
 /results/fills.csv
+/results/live_fills_pasted.csv

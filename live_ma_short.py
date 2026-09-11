@@ -657,12 +657,34 @@ def close_position(ex, st, sym, info, kind, why, extra='', ref_px=None):
         log(f'[{sym}][error] {kind}平仓失败: {e}')
 
 
+_equity_cache = None          # (ts, value)  网络失败时的兜底, 避免单轮 DNS 抖动打死进程
+EQUITY_CACHE_MAX_SEC = 6 * 3600   # 兜底最多用 6 小时, 超过强制重试
+
+
 def get_equity(ex):
-    """取账户权益(USDT)。干跑用名义权益, 真单查余额。每轮取一次即可。"""
+    """取账户权益(USDT)。干跑用名义权益, 真单查余额。每轮取一次即可。
+
+    fetch_balance 是纯只读、失败不影响持仓安全(交易所侧 TP/SL 委托独立运行),
+    所以网络抖动时退回上一次的成功值, 而不是让 _retry 重抛出去炸掉主循环。
+    仓位按权益算, 6 小时误差远小于死叉窗口的信号间隔, 可接受。
+    """
+    global _equity_cache
     if DRY_RUN:
         return DRY_EQUITY
-    bal = _retry(ex.fetch_balance, 'fetch_balance')
-    return float(bal['USDT']['total'])
+    try:
+        bal = _retry(ex.fetch_balance, 'fetch_balance')
+        v = float(bal['USDT']['total'])
+        _equity_cache = (time.time(), v)
+        return v
+    except Exception as e:
+        if _equity_cache:
+            ts, v = _equity_cache
+            age = time.time() - ts
+            log(f'[equity][fallback] fetch_balance 失败({type(e).__name__}), '
+                f'用 {age/3600:.1f}h 前的缓存 {v:.0f}U')
+            if age < EQUITY_CACHE_MAX_SEC:
+                return v
+        raise
 
 
 def contract_size(ex, sym):
